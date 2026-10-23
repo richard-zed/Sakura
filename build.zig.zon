@@ -1,0 +1,11 @@
+.{
+    .name = .sakura,
+    .version = "0.0.1",
+    .fingerprint = 0x1871032a235ccee,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
