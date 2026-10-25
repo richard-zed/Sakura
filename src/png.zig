@@ -477,9 +477,17 @@ fn pixelOf(info: Info, plte: []const u8, trns: []const u8, row: []const u8, x: u
 
     return switch (info.colour) {
         .grey => blk: {
-            const v = if (wide) row[at * 1] else sample(info, row, i);
-            const a: u8 = if (trns.len >= 2 and trns[1] == v) 0 else 255;
-            break :blk .{ v, v, v, a };
+            const v = if (wide) row[at] else sample(info, row, i);
+            // tRNS stores the sample in the FILE's depth: a raw 4-bit level for a
+            // 4-bit image, a full u16 for a 16-bit one. Comparing the SCALED
+            // value never matches below 8 bits.
+            const match = trns.len >= 2 and if (info.depth == 16)
+                ((@as(u32, trns[0]) << 8) | trns[1]) == ((@as(u32, row[at]) << 8) | row[at + 1])
+            else if (info.depth == 8)
+                trns[1] == v
+            else
+                ((@as(u32, trns[0]) << 8) | trns[1]) == unpackRaw(row, info.depth, i);
+            break :blk .{ v, v, v, if (match) 0 else 255 };
         },
         .rgb => blk: {
             const r = if (wide) row[i * 6] else row[i * 3];
@@ -496,7 +504,10 @@ fn pixelOf(info: Info, plte: []const u8, trns: []const u8, row: []const u8, x: u
             break :blk .{ r, g, b, a };
         },
         .palette => blk: {
-            const idx = if (info.depth == 8) row[i] else @as(u8, @intCast(unpack(row, info.depth, i)));
+            // A palette index is RAW, not scaled: unpack() maps sub-byte samples
+            // onto 0..255 for greyscale, which would turn index 1 into 17 at
+            // depth 4 and run off the end of the palette.
+            const idx = if (info.depth == 8) row[i] else @as(u8, @intCast(unpackRaw(row, info.depth, i)));
             const a: u8 = if (idx < trns.len) trns[idx] else 255;
             const p = @as(usize, idx) * 3;
             if (p + 2 >= plte.len) break :blk .{ 0, 0, 0, a };
@@ -515,15 +526,22 @@ fn pixelOf(info: Info, plte: []const u8, trns: []const u8, row: []const u8, x: u
 
 /// Sample `x` from a sub-byte row: samples pack high-order first.
 fn unpack(row: []const u8, depth: u8, x: usize) u32 {
+    const mask: u8 = @intCast((@as(u16, 1) << @as(u4, @intCast(depth))) - 1);
+    const raw = unpackRaw(row, depth, x);
+    // A 1/2/4-bit grey sample is scaled to the full 0..255 range, so 1-bit
+    // white reads as 255 rather than 1.
+    return @as(u32, raw) * 255 / mask;
+}
+
+/// Raw sub-byte sample, no scaling. Palette indices need this; greyscale does
+/// not, because a 1-bit grey sample must read as 255 rather than 1.
+fn unpackRaw(row: []const u8, depth: u8, x: usize) u32 {
     const per_byte = 8 / @as(usize, depth);
     const byte = row[x / per_byte];
     const slot = x % per_byte;
     const shift: u3 = @intCast(8 - @as(usize, depth) * (slot + 1));
     const mask: u8 = @intCast((@as(u16, 1) << @as(u4, @intCast(depth))) - 1);
-    const raw = (byte >> shift) & mask;
-    // A 1/2/4-bit grey sample is scaled to the full 0..255 range, so 1-bit
-    // white reads as 255 rather than 1.
-    return @as(u32, raw) * 255 / mask;
+    return (byte >> shift) & mask;
 }
 
 /// Greyscale at a sub-byte depth, already scaled.
@@ -674,6 +692,49 @@ test "poster-frame interlaced files decode as stills without special casing" {
     const data = fixture(&buf, 4, 4, 8, 6, 0, &.{.{ .ctype = "acTL", .data = &.{ 0, 0, 0, 2 } }});
     const img = try imageSize(data, .rgba8);
     try testing.expectEqual(@as(u32, 4), img.width);
+}
+
+test "a palette index is raw, not scaled to 0..255" {
+    // unpack() maps a sub-byte sample onto the full range, which is right for
+    // greyscale and wrong for a palette index: index 1 at depth 4 would become
+    // 17 and run off the end of the palette.
+    const info = Info{ .width = 1, .height = 1, .depth = 4, .colour = .palette, .interlace = 0 };
+    const plte = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60 }; // entry 1 = 40,50,60
+    // One byte holds two depth-4 samples: index 1 in the high nibble.
+    const row = [_]u8{0x10};
+    const px = pixelOf(info, &plte, &.{}, &row, 0);
+    try testing.expectEqual([4]u8{ 0x40, 0x50, 0x60, 255 }, px);
+
+    // The same byte's low nibble is index 0.
+    const px0 = pixelOf(info, &plte, &.{}, &row, 1);
+    try testing.expectEqual([4]u8{ 0x10, 0x20, 0x30, 255 }, px0);
+}
+
+test "greyscale tRNS compares the raw sample, not the scaled one" {
+    // tRNS stores the sample in the file's own depth. A depth-4 image with
+    // tRNS 0x000f means "level 15 is transparent" -- the raw value, which the
+    // scaled 255 must not be compared against.
+    const info = Info{ .width = 2, .height = 1, .depth = 4, .colour = .grey, .interlace = 0 };
+    const row = [_]u8{0xf0}; // sample 15 then 0
+    const trns = [_]u8{ 0x00, 0x0f };
+
+    const hit = pixelOf(info, &.{}, &trns, &row, 0);
+    try testing.expectEqual(@as(u8, 255), hit[0]);
+    try testing.expectEqual(@as(u8, 0), hit[3]);
+
+    const miss = pixelOf(info, &.{}, &trns, &row, 1);
+    try testing.expectEqual(@as(u8, 0), miss[0]);
+    try testing.expectEqual(@as(u8, 255), miss[3]);
+}
+
+test "a 16-bit sample reduces to its high byte" {
+    // libpng's strip_16 takes the high byte; scaling instead would put us one
+    // step off every reference decoder. ImageMagick rounds, so this is the
+    // value that must be pinned rather than inferred from a visual diff.
+    const info = Info{ .width = 1, .height = 1, .depth = 16, .colour = .rgb, .interlace = 0 };
+    const row = [_]u8{ 0xbd, 0xf7, 0xff, 0xff, 0x00, 0x00 };
+    const px = pixelOf(info, &.{}, &.{}, &row, 0);
+    try testing.expectEqual([4]u8{ 0xbd, 0xff, 0x00, 255 }, px);
 }
 
 test "every legal colour type and depth is accepted, and illegal ones are not" {
