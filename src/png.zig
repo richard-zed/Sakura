@@ -737,6 +737,32 @@ test "a 16-bit sample reduces to its high byte" {
     try testing.expectEqual([4]u8{ 0xbd, 0xff, 0x00, 255 }, px);
 }
 
+test "an animated PNG decodes as its default frame" {
+    // 100x100 RGBA8, acTL/20 frames: the still lives in IDAT and the animation
+    // in fdAT, so an APNG must decode as frame 0 with no special casing. The
+    // hash is of the reference frame-0 decode, so a wrong composite or a
+    // read of fdAT data fails here.
+    const data = @embedFile("testdata/apng_default_frame.png");
+    try testing.expect(sniff(data));
+    const img = try imageSize(data, .rgba8);
+    try testing.expectEqual(@as(u32, 100), img.width);
+    try testing.expectEqual(@as(u32, 100), img.height);
+
+    const want = try testing.allocator.alloc(u8, img.byteLen());
+    defer testing.allocator.free(want);
+    const scratch = try testing.allocator.alloc(u8, try scratchSize(data, .rgba8));
+    defer testing.allocator.free(scratch);
+    const dec = try decode(data, .rgba8, .strict, want, scratch);
+    try testing.expectEqual(types.Damage.none, dec.damage);
+
+    var h: u32 = 2166136261;
+    for (want) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    try testing.expectEqual(@as(u32, 0x1a3ee928), h);
+}
+
 test "every legal colour type and depth is accepted, and illegal ones are not" {
     var buf: [64]u8 = undefined;
     const legal = .{
