@@ -1,0 +1,6 @@
+PNG Suite 2.5 (Willem van Schaik) -- https://github.com/pngsuite/pngsuite
+Licence: free to use for any purpose (see README in the suite).
+
+Committed so the corpus cannot be lost; test/pngsuite is the authoritative copy.
+Filename convention encodes the format: e.g. basn2c16 = basic, non-interlaced,
+colour type 2 (truecolour), bit depth 16. 'i' in place of 'n' = Adam7 interlaced.

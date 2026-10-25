@@ -303,9 +303,6 @@ pub fn decode(
     const img = try imageSize(bytes, want);
     if (out.len < img.byteLen()) return error.OutTooSmall;
     if (scratch.len < try scratchSize(bytes, want)) return error.ScratchTooSmall;
-    // Sub-byte and 16-bit depths are sized but not yet unpacked; say so rather
-    // than writing a plausible wrong picture.
-    if (info.depth != 8) return error.Unsupported;
 
     const comp_total = try compressedTotal(bytes);
     const filt_total = filteredTotal(info);
@@ -347,7 +344,7 @@ pub fn decode(
     if (damage != .none and policy == .strict) return error.Truncated;
     const data = filt[0..@min(got, filt_total)];
 
-    const bpp = @as(usize, info.colour.channels());
+    const bpp = filterBpp(info);
     var cursor: usize = 0;
 
     if (!info.interlaced()) {
@@ -383,7 +380,6 @@ pub fn decode(
 
     return .{ .image = img, .damage = damage };
 }
-
 
 /// Total filtered bytes the DEFLATE stream must yield: one filter byte plus a
 /// row of samples per scanline, summed over passes.
@@ -460,32 +456,80 @@ fn unfilter(ft: u8, row: []u8, prev: ?[]const u8, bpp: usize) Error!void {
     }
 }
 
+/// Bytes per pixel as the FILTER sees it, which is not the channel count:
+/// sub-byte depths pack several samples into one byte, so the stride is 1, and
+/// a 16-bit sample is two bytes. Getting this wrong corrupts every filtered
+/// row silently -- the filter still runs, it just reconstructs noise.
+fn filterBpp(info: Info) usize {
+    const bits = @as(usize, info.colour.channels()) * info.depth;
+    const bytes = (bits + 7) / 8;
+    return if (bytes == 0) 1 else bytes;
+}
+
 fn pixelOf(info: Info, plte: []const u8, trns: []const u8, row: []const u8, x: u32) [4]u8 {
     const i: usize = x;
+    // 16-bit samples are read big-endian and reduced to their HIGH byte. That is
+    // what libpng's strip_16 does and what every 8-bit consumer expects; scaling
+    // instead would put us one step off every reference decoder.
+    const wide = info.depth == 16;
+    const ch = info.colour.channels();
+    const at = if (wide) i * @as(usize, ch) * 2 else i * @as(usize, ch);
+
     return switch (info.colour) {
         .grey => blk: {
-            const v = row[i];
+            const v = if (wide) row[at * 1] else sample(info, row, i);
             const a: u8 = if (trns.len >= 2 and trns[1] == v) 0 else 255;
             break :blk .{ v, v, v, a };
         },
         .rgb => blk: {
-            const r = row[i * 3];
-            const g = row[i * 3 + 1];
-            const b = row[i * 3 + 2];
+            const r = if (wide) row[i * 6] else row[i * 3];
+            const g = if (wide) row[i * 6 + 2] else row[i * 3 + 1];
+            const b = if (wide) row[i * 6 + 4] else row[i * 3 + 2];
             var a: u8 = 255;
+            // tRNS stores full 16-bit samples for a 16-bit image, so the high
+            // byte of each field is what the comparison is against.
+            const toff: usize = if (wide) 0 else 0;
+            const step: usize = if (wide) 2 else 1;
             if (trns.len >= 6 and trns[1] == r and trns[3] == g and trns[5] == b) a = 0;
+            if (wide and trns.len >= 6 and trns[toff] == r and trns[toff + 2] == g and trns[toff + 4] == b) a = 0;
+            _ = step;
             break :blk .{ r, g, b, a };
         },
         .palette => blk: {
-            const idx = row[i];
+            const idx = if (info.depth == 8) row[i] else @as(u8, @intCast(unpack(row, info.depth, i)));
             const a: u8 = if (idx < trns.len) trns[idx] else 255;
             const p = @as(usize, idx) * 3;
             if (p + 2 >= plte.len) break :blk .{ 0, 0, 0, a };
             break :blk .{ plte[p], plte[p + 1], plte[p + 2], a };
         },
-        .grey_alpha => .{ row[i * 2], row[i * 2], row[i * 2], row[i * 2 + 1] },
-        .rgba => .{ row[i * 4], row[i * 4 + 1], row[i * 4 + 2], row[i * 4 + 3] },
+        .grey_alpha => if (wide)
+            .{ row[i * 4], row[i * 4], row[i * 4], row[i * 4 + 2] }
+        else
+            .{ row[i * 2], row[i * 2], row[i * 2], row[i * 2 + 1] },
+        .rgba => if (wide)
+            .{ row[i * 8], row[i * 8 + 2], row[i * 8 + 4], row[i * 8 + 6] }
+        else
+            .{ row[i * 4], row[i * 4 + 1], row[i * 4 + 2], row[i * 4 + 3] },
     };
+}
+
+/// Sample `x` from a sub-byte row: samples pack high-order first.
+fn unpack(row: []const u8, depth: u8, x: usize) u32 {
+    const per_byte = 8 / @as(usize, depth);
+    const byte = row[x / per_byte];
+    const slot = x % per_byte;
+    const shift: u3 = @intCast(8 - @as(usize, depth) * (slot + 1));
+    const mask: u8 = @intCast((@as(u16, 1) << @as(u4, @intCast(depth))) - 1);
+    const raw = (byte >> shift) & mask;
+    // A 1/2/4-bit grey sample is scaled to the full 0..255 range, so 1-bit
+    // white reads as 255 rather than 1.
+    return @as(u32, raw) * 255 / mask;
+}
+
+/// Greyscale at a sub-byte depth, already scaled.
+fn sample(info: Info, row: []const u8, x: usize) u8 {
+    if (info.depth == 8) return row[x];
+    return @intCast(unpack(row, info.depth, x));
 }
 
 const Dest = struct { x: u32, y: u32 };
