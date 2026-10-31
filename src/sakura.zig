@@ -7,12 +7,12 @@
 //! decoding is reentrant and thread-safe by construction and `out` may be a
 //! sub-slice of a larger buffer.
 //!
-//! Conventions, shared with Cedar:
+//! House conventions this decoder is built to:
 //!   * no allocator anywhere; every output buffer is caller-owned
 //!   * every buffer size is derivable from the header, BEFORE decoding
 //!   * Debug is the gate; ReleaseFast is for profiling only
-//!   * pixels are STRAIGHT (non-premultiplied) alpha, matching Elm's
-//!     source-over blend
+//!   * pixels are STRAIGHT (non-premultiplied) alpha, so a caller blending
+//!     source-over does not have to un-premultiply first
 //!
 //! The caller never switches on format: bytes go in, `sniff` decides, and the
 //! per-format module is an implementation detail. That is the whole reason PNG

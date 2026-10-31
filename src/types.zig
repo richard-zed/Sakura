@@ -66,10 +66,15 @@ pub const Damage = enum {
     none,
     /// Input ended early. Undecoded regions hold zero.
     truncated,
-    /// A non-essential chunk was unreadable and skipped.
+    /// A non-essential chunk was unreadable and skipped. Only ever produced
+    /// when the chunk is one this decoder does not read: a bad CRC on IHDR,
+    /// PLTE, tRNS or eXIf is fatal in both policies, because those decode to
+    /// wrong pixels with no other symptom.
+    ///
+    /// There is deliberately no `corrupt_blocks`. Recovering mid-stream from a
+    /// damaged DEFLATE stream is not implemented, and a variant naming a
+    /// behaviour the decoder cannot produce is a lie in the type.
     skipped_ancillary,
-    /// Some blocks could not be decoded. They hold zero.
-    corrupt_blocks,
 };
 
 pub const Decoded = struct {
@@ -78,7 +83,7 @@ pub const Decoded = struct {
 };
 
 /// Closed on purpose, and deliberately free of prose: naming *which* byte was
-/// bad is the caller's job (Elm has a diagnostic band for exactly that).
+/// bad is the caller's job -- this layer reports, it does not display.
 pub const Error = error{
     NotAnImage,
     /// Recognised, but this format or variant is not implemented.

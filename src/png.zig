@@ -1,5 +1,5 @@
-//! PNG. Chunk walk, IHDR, Adam7 geometry and buffer sizing are real; the IDAT
-//! path is the next piece of work.
+//! PNG. Chunk walk, IHDR, PLTE/tRNS, the IDAT stream, Adam7, `eXIf` orientation,
+//! and every legal colour-type/bit-depth combination.
 //!
 //! Scope is deliberately wide: every legal colour-type/bit-depth combination,
 //! Adam7, `tRNS`, and `eXIf` orientation. What is *not* here is colour
@@ -177,6 +177,20 @@ fn crc(bytes: []const u8, pos: usize, len: u32) u32 {
 /// reads the image. It also means cost is independent of image size, which is
 /// the whole point of a separate `imageSize`.
 pub fn scan(bytes: []const u8) Error!Info {
+    return scanPolicy(bytes, .strict, null);
+}
+
+/// Chunk types whose contents this decoder consumes. A bad CRC on one of these
+/// is always fatal: a corrupt palette or tRNS decodes to wrong pixels silently,
+/// which is worse than refusing. Everywhere else the CRC is advisory.
+fn isRead(type_code: []const u8) bool {
+    return std.mem.eql(u8, type_code, "IHDR") or
+        std.mem.eql(u8, type_code, "PLTE") or
+        std.mem.eql(u8, type_code, "tRNS") or
+        std.mem.eql(u8, type_code, "eXIf");
+}
+
+pub fn scanPolicy(bytes: []const u8, policy: types.Policy, damaged: ?*bool) Error!Info {
     if (!sniff(bytes)) return error.NotAnImage;
 
     var info: Info = undefined;
@@ -191,8 +205,15 @@ pub fn scan(bytes: []const u8) Error!Info {
         const data_end = data_at + @as(usize, len);
         if (data_end + 4 > bytes.len) return error.Truncated;
 
-        if (crc(bytes, pos, len) != std.mem.readInt(u32, bytes[data_end..][0..4], .big))
-            return error.Corrupt;
+        if (crc(bytes, pos, len) != std.mem.readInt(u32, bytes[data_end..][0..4], .big)) {
+            if (isRead(ctype)) return error.Corrupt;
+            if (policy == .strict) return error.Corrupt;
+            // Lenient: an unreadable chunk this decoder ignores cannot affect
+            // the pixels, so skip it and record that it happened.
+            if (damaged) |d| d.* = true;
+            pos = data_end + 4;
+            continue;
+        }
 
         const data = bytes[data_at..data_end];
 
@@ -265,22 +286,18 @@ pub fn imageSize(bytes: []const u8, want: PixelFormat) Error!Image {
     return .{ .width = w, .height = h, .format = want, .source = .png };
 }
 
-/// True when the stored sample cannot be memcpy'd into the output row shape:
-/// a different sample width, a sub-byte or 16-bit depth, a palette to look up,
-/// or a `tRNS` colour to turn into alpha.
-fn needsPeel(info: Info, want: PixelFormat) bool {
-    if (info.depth != 8) return true;
-    if (info.colour == .palette) return true;
-    if (info.has_trns and want.hasAlpha()) return true;
-    return @as(usize, info.colour.channels()) != @as(usize, want.bytesPerPixel());
-}
-
 /// The DEFLATE sink is always needed. A row buffer is needed *in addition*
 /// whenever the output row is not a byte-for-byte copy of the stored one -- and
 /// ALWAYS for an interlaced image, because samples are scattered to strided
 /// positions and can never be unfiltered in place.
 pub fn scratchSize(bytes: []const u8, want: PixelFormat) Error!usize {
     const info = try scan(bytes);
+    return scratchSizeFor(bytes, info, want);
+}
+
+/// Same figure, from an `Info` already in hand. The size does not depend on
+/// policy, so a caller that has walked the file must not walk it again.
+fn scratchSizeFor(bytes: []const u8, info: Info, want: PixelFormat) Error!usize {
     if (!convertible(info, want)) return error.UnsupportedConversion;
 
     // Joined IDAT stream, then the filtered scanlines, then the DEFLATE sink
@@ -299,10 +316,12 @@ pub fn decode(
     out: []u8,
     scratch: []u8,
 ) Error!types.Decoded {
-    const info = try scan(bytes);
-    const img = try imageSize(bytes, want);
+    var skipped: bool = false;
+    const info = try scanPolicy(bytes, policy, &skipped);
+    if (!convertible(info, want)) return error.UnsupportedConversion;
+    const img = Image{ .width = info.width, .height = info.height, .format = want, .source = .png };
     if (out.len < img.byteLen()) return error.OutTooSmall;
-    if (scratch.len < try scratchSize(bytes, want)) return error.ScratchTooSmall;
+    if (scratch.len < try scratchSizeFor(bytes, info, want)) return error.ScratchTooSmall;
 
     const comp_total = try compressedTotal(bytes);
     const filt_total = filteredTotal(info);
@@ -313,6 +332,11 @@ pub fn decode(
     var at: usize = 0;
     var plte: []const u8 = &.{};
     var trns: []const u8 = &.{};
+    // Chunk ordering is a spec requirement, not a style preference: PLTE and
+    // tRNS describe the IDAT stream that follows them, so any found afterwards
+    // cannot apply to it. Taking the last one would silently decode with a
+    // palette that appears after the pixels it colours.
+    var seen_idat = false;
     while (pos + 8 <= bytes.len) {
         const len = std.mem.readInt(u32, bytes[pos..][0..4], .big);
         const ctype = bytes[pos + 4 ..][0..4];
@@ -320,9 +344,16 @@ pub fn decode(
         const data_end = data_at + @as(usize, len);
         if (data_end + 4 > bytes.len) return error.Truncated;
         const data = bytes[data_at..data_end];
-        if (std.mem.eql(u8, ctype, "PLTE")) plte = data;
-        if (std.mem.eql(u8, ctype, "tRNS")) trns = data;
-        if (std.mem.eql(u8, ctype, "IDAT")) {
+        if (std.mem.eql(u8, ctype, "PLTE")) {
+            if (seen_idat) return error.Corrupt;
+            if (plte.len != 0) return error.Corrupt; // at most one
+            plte = data;
+        } else if (std.mem.eql(u8, ctype, "tRNS")) {
+            if (seen_idat) return error.Corrupt;
+            if (trns.len != 0) return error.Corrupt;
+            trns = data;
+        } else if (std.mem.eql(u8, ctype, "IDAT")) {
+            seen_idat = true;
             @memcpy(scratch[at..][0..len], data);
             at += len;
         }
@@ -340,7 +371,8 @@ pub fn decode(
         break :blk 0;
     };
     const got = w.end;
-    const damage: types.Damage = if (got == filt_total) .none else .truncated;
+    // Truncation outranks a skipped chunk: it means pixels are missing.
+    const damage: types.Damage = if (got != filt_total) .truncated else if (skipped) .skipped_ancillary else .none;
     if (damage != .none and policy == .strict) return error.Truncated;
     const data = filt[0..@min(got, filt_total)];
 
@@ -886,4 +918,199 @@ test "a header that stops early is Truncated, not Corrupt" {
     var buf: [64]u8 = undefined;
     const data = fixture(&buf, 4, 4, 8, 6, 0, &.{});
     try testing.expectError(error.Truncated, imageSize(data[0..20], .rgba8));
+}
+
+/// Build a decode-ready PNG from raw (unfiltered) scanlines: deflates the
+/// filtered rows, emits IHDR, the given pre-IDAT chunks, IDAT, then any
+/// post-IDAT chunks before IEND. Used by the lenient and ordering tests,
+/// which need a stream that actually decompresses.
+fn buildPng(
+    buf: []u8,
+    w: u32,
+    h: u32,
+    depth: u8,
+    colour: u8,
+    rows: []const u8,
+    pre: []const Extra,
+    post: []const Extra,
+) []const u8 {
+    @memcpy(buf[0..8], &signature);
+    var f = Builder{ .b = buf, .n = 8 };
+
+    var ihdr: [13]u8 = undefined;
+    std.mem.writeInt(u32, ihdr[0..4], w, .big);
+    std.mem.writeInt(u32, ihdr[4..8], h, .big);
+    ihdr[8] = depth;
+    ihdr[9] = colour;
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    f.chunk("IHDR", &ihdr);
+
+    for (pre) |e| f.chunk(e.ctype, e.data);
+
+    // zlib wrapper: 0x78 0x01, deflate stored-free (fixed Huffman via
+    // stored blocks is simplest: no compressor needed for tiny fixtures).
+    var z: [512]u8 = undefined;
+    var zn: usize = 0;
+    z[0] = 0x78;
+    z[1] = 0x01;
+    zn = 2;
+    var off: usize = 0;
+    while (off < rows.len) {
+        const n = @min(@as(usize, 0xffff), rows.len - off);
+        const last: u8 = if (off + n >= rows.len) 1 else 0;
+        z[zn] = last;
+        zn += 1;
+        std.mem.writeInt(u16, z[zn..][0..2], @intCast(n), .little);
+        zn += 2;
+        std.mem.writeInt(u16, z[zn..][0..2], ~@as(u16, @intCast(n)), .little);
+        zn += 2;
+        @memcpy(z[zn..][0..n], rows[off..][0..n]);
+        zn += n;
+        off += n;
+    }
+    var a: u32 = 1;
+    var b: u32 = 0;
+    for (z[0..zn]) |byte| {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    const adler = (b << 16) | a;
+    std.mem.writeInt(u32, z[zn..][0..4], adler, .big);
+    zn += 4;
+
+    f.chunk("IDAT", z[0..zn]);
+    for (post) |e| f.chunk(e.ctype, e.data);
+    f.chunk("IEND", &.{});
+    return f.b[0..f.n];
+}
+
+test "a truncated IDAT stream decodes what survived under lenient, and errors under strict" {
+    // 4x4 RGB8 = 4 rows of (1 filter byte + 12 sample bytes) = 52 filtered
+    // bytes. Only two rows reach the stream, so the bottom half is undecoded.
+    const full = [_]u8{0} ** 52;
+    var buf: [1024]u8 = undefined;
+    var built = buildPng(&buf, 4, 4, 8, 2, &full, &.{}, &.{});
+
+    // Cut the IDAT payload down to two rows' worth, then re-seal CRCs by
+    // rebuilding from the shortened data rather than patching a length.
+    const half = [_]u8{0} ** 26;
+    built = buildPng(&buf, 4, 4, 8, 2, &half, &.{}, &.{});
+
+    const img = try imageSize(built, .rgba8);
+    const out = try testing.allocator.alloc(u8, img.byteLen());
+    defer testing.allocator.free(out);
+    const scratch = try testing.allocator.alloc(u8, try scratchSize(built, .rgba8));
+    defer testing.allocator.free(scratch);
+
+    // Strict refuses: a short decode is data loss the caller did not ask for.
+    try testing.expectError(error.Truncated, decode(built, .rgba8, .strict, out, scratch));
+
+    // Lenient reports it and leaves the undecoded region zeroed.
+    @memset(out, 0xAA);
+    const dec = try decode(built, .rgba8, .lenient, out, scratch);
+    try testing.expectEqual(types.Damage.truncated, dec.damage);
+    // Bottom rows were never written, so they must still hold the sentinel.
+    try testing.expectEqual(@as(u8, 0xAA), out[out.len - 1]);
+}
+
+test "PLTE after IDAT is refused rather than silently applied" {
+    // The palette colours the IDAT stream that precedes it, so a later one
+    // cannot apply. Taking the last value found would decode correctly-shaped
+    // pixels with the wrong colours and no error.
+    const rows = [_]u8{0} ** 52; // 4x4 RGB8 = 4 rows x (1 filter + 12 samples)
+    const plte = [_]u8{ 0, 0, 0, 0xff, 0xff, 0xff };
+    var buf: [1024]u8 = undefined;
+
+    // Before IDAT is legal and must still decode.
+    const ok = buildPng(&buf, 4, 4, 8, 2, &rows, &.{.{ .ctype = "PLTE", .data = &plte }}, &.{});
+    const img = try imageSize(ok, .rgba8);
+    const out = try testing.allocator.alloc(u8, img.byteLen());
+    defer testing.allocator.free(out);
+    const scratch = try testing.allocator.alloc(u8, try scratchSize(ok, .rgba8));
+    defer testing.allocator.free(scratch);
+    _ = try decode(ok, .rgba8, .strict, out, scratch);
+
+    // After IDAT is a spec violation.
+    var buf2: [1024]u8 = undefined;
+    const bad = buildPng(&buf2, 4, 4, 8, 2, &rows, &.{}, &.{.{ .ctype = "PLTE", .data = &plte }});
+    try testing.expectError(error.Corrupt, decode(bad, .rgba8, .strict, out, scratch));
+}
+
+test "a duplicate PLTE is refused" {
+    const rows = [_]u8{0} ** 52;
+    const plte = [_]u8{ 0, 0, 0, 0xff, 0xff, 0xff };
+    var buf: [1024]u8 = undefined;
+    const bad = buildPng(&buf, 4, 4, 8, 2, &rows, &.{
+        .{ .ctype = "PLTE", .data = &plte },
+        .{ .ctype = "PLTE", .data = &plte },
+    }, &.{});
+    const img = try imageSize(bad, .rgba8);
+    const out = try testing.allocator.alloc(u8, img.byteLen());
+    defer testing.allocator.free(out);
+    const scratch = try testing.allocator.alloc(u8, try scratchSize(bad, .rgba8));
+    defer testing.allocator.free(scratch);
+    try testing.expectError(error.Corrupt, decode(bad, .rgba8, .strict, out, scratch));
+}
+
+test "a bad CRC on a chunk the decoder ignores is fatal under strict, a skip under lenient" {
+    // tEXt is not read by anything here, so its contents cannot affect pixels.
+    // Refusing the whole image over one bad metadata chunk is the strict rule;
+    // lenient must decode and say what it tolerated.
+    const rows = [_]u8{0} ** 52; // 4x4 RGB8
+    const text = "Comment\x00hello";
+    var buf: [1024]u8 = undefined;
+    const good = buildPng(&buf, 4, 4, 8, 2, &rows, &.{.{ .ctype = "tEXt", .data = text }}, &.{});
+
+    const img = try imageSize(good, .rgba8);
+    const out = try testing.allocator.alloc(u8, img.byteLen());
+    defer testing.allocator.free(out);
+    const scratch = try testing.allocator.alloc(u8, try scratchSize(good, .rgba8));
+    defer testing.allocator.free(scratch);
+
+    // Clean file decodes with no damage recorded.
+    const clean = try decode(good, .rgba8, .lenient, out, scratch);
+    try testing.expectEqual(types.Damage.none, clean.damage);
+
+    // Corrupt the tEXt CRC: flip the last of its four CRC bytes.
+    var bad: [1024]u8 = undefined;
+    @memcpy(bad[0..good.len], good);
+    const t = bad[0..good.len];
+    const at = std.mem.indexOf(u8, t, "tEXt").?;
+    var crc_at: usize = 0;
+    {
+        const len = std.mem.readInt(u32, t[at - 4 ..][0..4], .big);
+        crc_at = at + 4 + len;
+    }
+    bad[crc_at + 3] ^= 0xff;
+
+    try testing.expectError(error.Corrupt, decode(bad[0..good.len], .rgba8, .strict, out, scratch));
+
+    const dec = try decode(bad[0..good.len], .rgba8, .lenient, out, scratch);
+    try testing.expectEqual(types.Damage.skipped_ancillary, dec.damage);
+}
+
+test "a bad CRC on a chunk the decoder reads is fatal even under lenient" {
+    // A corrupt PLTE decodes to wrong colours with no other symptom, so it can
+    // never be a "tolerate and continue" case.
+    const rows = [_]u8{0} ** 52;
+    const plte = [_]u8{ 0, 0, 0, 0xff, 0xff, 0xff };
+    var buf: [1024]u8 = undefined;
+    const good = buildPng(&buf, 4, 4, 8, 2, &rows, &.{.{ .ctype = "PLTE", .data = &plte }}, &.{});
+
+    var bad: [1024]u8 = undefined;
+    @memcpy(bad[0..good.len], good);
+    const t = bad[0..good.len];
+    const at = std.mem.indexOf(u8, t, "PLTE").?;
+    const len = std.mem.readInt(u32, t[at - 4 ..][0..4], .big);
+    bad[at + 4 + len + 3] ^= 0xff;
+
+    const img = try imageSize(good, .rgba8);
+    const out = try testing.allocator.alloc(u8, img.byteLen());
+    defer testing.allocator.free(out);
+    const scratch = try testing.allocator.alloc(u8, try scratchSize(good, .rgba8));
+    defer testing.allocator.free(scratch);
+
+    try testing.expectError(error.Corrupt, decode(bad[0..good.len], .rgba8, .lenient, out, scratch));
 }

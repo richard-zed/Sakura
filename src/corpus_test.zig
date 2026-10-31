@@ -12,12 +12,12 @@ const std = @import("std");
 const png = @import("png.zig");
 const types = @import("types.zig");
 
-/// Corpus root, injected by build.zig as an ABSOLUTE path.
+/// PngSuite corpus root, injected by build.zig as an ABSOLUTE path.
 /// @src().file is cwd-relative for a bare filename, so deriving the path here
 /// silently walked zero files. See the build_options stanza in build.zig.
 const build_options = @import("build_options");
 fn corpusDir() []const u8 {
-    return build_options.corpus_root;
+    return build_options.pngsuite_root;
 }
 
 /// Whether a reference image exists for this fixture. PngSuite's `x*` corpus is
@@ -137,8 +137,8 @@ test "every PNG Suite image with a reference decodes to it" {
     }
 
     std.debug.print(
-        "\ncorpus: {d} compared, {d} byte-exact, {d} within tolerance, {d} no-reference, {d} broken\n",
-        .{ checked, exact, near, skipped, broken },
+        "\npngsuite: {d} compared, {d} byte-exact, {d} within tolerance, {d} no-reference, {d} fault{s}\n",
+        .{ checked, exact, near, skipped, broken, if (broken == 1) "" else "s" },
     );
     // Pinned, not a floor: a regression that silently drops files must fail here.
     try std.testing.expectEqual(@as(usize, 0), broken);
@@ -157,4 +157,149 @@ fn is16(name: []const u8) bool {
 
 fn refIs8(name: []const u8) bool {
     return !is16(name);
+}
+
+// --- Real-world corpus -------------------------------------------------------
+//
+// The PngSuite pass above is graded partly by its own output (the 16-bit
+// references) and is otherwise synthetic. These seven files are ordinary
+// encoders' output, and `expected.txt` carries sha256 of the decoded RGBA8
+// that was verified against ImageMagick -- an oracle this decoder did not
+// produce. Files are fetched by tools/fetch_corpus.sh, not committed, so a
+// missing file is a skip rather than a failure.
+
+const Expect = struct {
+    sha: [64]u8,
+    bytes: usize,
+    w: u32,
+    h: u32,
+};
+
+fn realworldDir() []const u8 {
+    return build_options.realworld_root;
+}
+
+/// Parse one `sha  bytes  WxH  ColourType  file` line.
+fn parseExpect(line: []const u8) ?struct { name: []const u8, e: Expect } {
+    if (line.len == 0 or line[0] == '#') return null;
+    var it = std.mem.tokenizeAny(u8, line, " \t");
+    const sha_tok = it.next() orelse return null;
+    const bytes_tok = it.next() orelse return null;
+    const geom_tok = it.next() orelse return null;
+    _ = it.next() orelse return null; // colour type, informational
+    const name = it.next() orelse return null;
+    if (sha_tok.len != 64) return null;
+
+    const x = std.mem.indexOfScalar(u8, geom_tok, 'x') orelse return null;
+    var e: Expect = .{
+        .sha = undefined,
+        .bytes = std.fmt.parseInt(usize, bytes_tok, 10) catch return null,
+        .w = std.fmt.parseInt(u32, geom_tok[0..x], 10) catch return null,
+        .h = std.fmt.parseInt(u32, geom_tok[x + 1 ..], 10) catch return null,
+    };
+    @memcpy(&e.sha, sha_tok);
+    return .{ .name = name, .e = e };
+}
+
+test "every real-world corpus file decodes to its ImageMagick-verified hash" {
+    const t = std.testing.io;
+    var alloc_io: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = alloc_io.deinit();
+    const a = alloc_io.allocator();
+
+    var path_buf: [512]u8 = undefined;
+    const exp_path = try std.fmt.bufPrint(&path_buf, "{s}/expected.txt", .{realworldDir()});
+    const text = std.Io.Dir.cwd().readFileAlloc(t, exp_path, a, .limited(1 << 20)) catch |e| {
+        std.debug.print("\nrealworld: expected.txt missing ({t}), skipping all\n", .{e});
+        return;
+    };
+    defer a.free(text);
+
+    var checked: usize = 0;
+    var absent: usize = 0;
+    var faults: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const entry = parseExpect(line) orelse continue;
+        const e = entry.e;
+
+        var fbuf: [512]u8 = undefined;
+        const fpath = try std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ realworldDir(), entry.name });
+        const bytes = std.Io.Dir.cwd().readFileAlloc(t, fpath, a, .limited(64 << 20)) catch {
+            absent += 1; // not fetched yet -- a skip, not a fault
+            continue;
+        };
+        defer a.free(bytes);
+
+        const img = png.imageSize(bytes, .rgba8) catch |err| {
+            std.debug.print("  {s}: imageSize failed: {t}\n", .{ entry.name, err });
+            faults += 1;
+            continue;
+        };
+        if (img.width != e.w or img.height != e.h) {
+            std.debug.print("  {s}: geometry {d}x{d}, expected {d}x{d}\n", .{ entry.name, img.width, img.height, e.w, e.h });
+            faults += 1;
+            continue;
+        }
+
+        const out = try a.alloc(u8, img.byteLen());
+        defer a.free(out);
+        const scratch_len = try png.scratchSize(bytes, .rgba8);
+        const scratch = try a.alloc(u8, scratch_len);
+        defer a.free(scratch);
+
+        _ = png.decode(bytes, .rgba8, .strict, out, scratch) catch |err| {
+            std.debug.print("  {s}: decode failed: {t}\n", .{ entry.name, err });
+            faults += 1;
+            continue;
+        };
+
+        if (out.len != e.bytes) {
+            std.debug.print("  {s}: {d} bytes out, expected {d}\n", .{ entry.name, out.len, e.bytes });
+            faults += 1;
+            continue;
+        }
+
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(out, &digest, .{});
+        var hex: [64]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{x}", .{&digest}) catch unreachable;
+
+        if (!std.mem.eql(u8, &hex, &e.sha)) {
+            std.debug.print("  {s}: hash mismatch\n    want {s}\n    got  {s}\n", .{ entry.name, e.sha, hex });
+            faults += 1;
+            continue;
+        }
+        checked += 1;
+    }
+
+    std.debug.print(
+        "\nrealworld: {d} matched, {d} absent, {d} fault{s}\n",
+        .{ checked, absent, faults, if (faults == 1) "" else "s" },
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), faults);
+
+    // Count the reference lines independently of the decode loop. If this
+    // disagrees with what was actually compared, files vanished from disk or
+    // the loop skipped something it should have graded -- and a corpus that
+    // loads nothing must never report success.
+    var reference_lines: usize = 0;
+    {
+        var it = std.mem.tokenizeScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            if (parseExpect(line) != null) reference_lines += 1;
+        }
+    }
+    if (reference_lines == 0) {
+        std.debug.print("\nrealworld: expected.txt lists no reference rows\n", .{});
+        return error.NoReferenceRows;
+    }
+    // big-4k.png is listed but not downloadable, so it is legitimately absent.
+    const expected_present = reference_lines - 1;
+    if (checked != expected_present) {
+        std.debug.print("\nrealworld: compared {d} of {d} expected rows ({d} absent)\n", .{ checked, expected_present, absent });
+        return error.CorpusIncomplete;
+    }
 }

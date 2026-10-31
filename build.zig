@@ -18,9 +18,10 @@ pub fn build(b: *std.Build) void {
     // temp file into place, and this filesystem rejects link().
     const opts = b.addWriteFiles();
     const opts_src = opts.add("build_options.zig", b.fmt(
-        "pub const corpus_root: []const u8 = \"{s}\";\n",
-        .{b.pathFromRoot("test/pngsuite")},
-    ));
+        \\pub const pngsuite_root: []const u8 = "{s}";
+        \\pub const realworld_root: []const u8 = "{s}";
+        \\
+    , .{ b.pathFromRoot("test/pngsuite"), b.pathFromRoot("test/corpus") }));
     const opts_mod = b.createModule(.{ .root_source_file = opts_src });
 
     const tests = b.addTest(.{
