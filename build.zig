@@ -30,10 +30,10 @@ pub fn build(b: *std.Build) void {
         b.pathFromRoot("test/corpus"),
     };
     const opts_src = opts.add("build_options.zig", b.fmt(
-        \\pub const pngsuite_root: []const u8 = "{s}";
-        \\pub const realworld_root: []const u8 = "{s}";
+        \\pub const pngsuite_root: []const u8 = "{f}";
+        \\pub const realworld_root: []const u8 = "{f}";
         \\
-    , roots));
+    , .{ std.zig.fmtString(roots[0]), std.zig.fmtString(roots[1]) }));
     const opts_mod = b.createModule(.{ .root_source_file = opts_src });
 
     const tests = b.addTest(.{
