@@ -989,13 +989,13 @@ fn buildPng(
 test "a truncated IDAT stream decodes what survived under lenient, and errors under strict" {
     // 4x4 RGB8 = 4 rows of (1 filter byte + 12 sample bytes) = 52 filtered
     // bytes. Only two rows reach the stream, so the bottom half is undecoded.
-    const full = [_]u8{0} ** 52;
+    const full: [52]u8 = @splat(0);
     var buf: [1024]u8 = undefined;
     var built = buildPng(&buf, 4, 4, 8, 2, &full, &.{}, &.{});
 
     // Cut the IDAT payload down to two rows' worth, then re-seal CRCs by
     // rebuilding from the shortened data rather than patching a length.
-    const half = [_]u8{0} ** 26;
+    const half: [26]u8 = @splat(0);
     built = buildPng(&buf, 4, 4, 8, 2, &half, &.{}, &.{});
 
     const img = try imageSize(built, .rgba8);
@@ -1019,7 +1019,7 @@ test "PLTE after IDAT is refused rather than silently applied" {
     // The palette colours the IDAT stream that precedes it, so a later one
     // cannot apply. Taking the last value found would decode correctly-shaped
     // pixels with the wrong colours and no error.
-    const rows = [_]u8{0} ** 52; // 4x4 RGB8 = 4 rows x (1 filter + 12 samples)
+    const rows: [52]u8 = @splat(0); // 4x4 RGB8 = 4 rows x (1 filter + 12 samples)
     const plte = [_]u8{ 0, 0, 0, 0xff, 0xff, 0xff };
     var buf: [1024]u8 = undefined;
 
@@ -1039,7 +1039,7 @@ test "PLTE after IDAT is refused rather than silently applied" {
 }
 
 test "a duplicate PLTE is refused" {
-    const rows = [_]u8{0} ** 52;
+    const rows: [52]u8 = @splat(0);
     const plte = [_]u8{ 0, 0, 0, 0xff, 0xff, 0xff };
     var buf: [1024]u8 = undefined;
     const bad = buildPng(&buf, 4, 4, 8, 2, &rows, &.{
@@ -1058,7 +1058,7 @@ test "a bad CRC on a chunk the decoder ignores is fatal under strict, a skip und
     // tEXt is not read by anything here, so its contents cannot affect pixels.
     // Refusing the whole image over one bad metadata chunk is the strict rule;
     // lenient must decode and say what it tolerated.
-    const rows = [_]u8{0} ** 52; // 4x4 RGB8
+    const rows: [52]u8 = @splat(0); // 4x4 RGB8
     const text = "Comment\x00hello";
     var buf: [1024]u8 = undefined;
     const good = buildPng(&buf, 4, 4, 8, 2, &rows, &.{.{ .ctype = "tEXt", .data = text }}, &.{});
@@ -1094,7 +1094,7 @@ test "a bad CRC on a chunk the decoder ignores is fatal under strict, a skip und
 test "a bad CRC on a chunk the decoder reads is fatal even under lenient" {
     // A corrupt PLTE decodes to wrong colours with no other symptom, so it can
     // never be a "tolerate and continue" case.
-    const rows = [_]u8{0} ** 52;
+    const rows: [52]u8 = @splat(0);
     const plte = [_]u8{ 0, 0, 0, 0xff, 0xff, 0xff };
     var buf: [1024]u8 = undefined;
     const good = buildPng(&buf, 4, 4, 8, 2, &rows, &.{.{ .ctype = "PLTE", .data = &plte }}, &.{});

@@ -17,11 +17,23 @@ pub fn build(b: *std.Build) void {
     // Written with addWriteFiles rather than addOptions: addOptions links a
     // temp file into place, and this filesystem rejects link().
     const opts = b.addWriteFiles();
+    // 0.17 removed Build.pathFromRoot: b.root became a Cache.Path, so the
+    // absolute root now comes from Cache.Path.joinString. The two APIs do not
+    // overlap -- each version fails to COMPILE on the other's form, so this has
+    // to be a comptime branch rather than a runtime fallback.
+    const Ver = @import("builtin").zig_version;
+    const roots = if (Ver.major == 0 and Ver.minor >= 17) .{
+        b.root.joinString(b.graph.arena, "test/pngsuite") catch @panic("OOM"),
+        b.root.joinString(b.graph.arena, "test/corpus") catch @panic("OOM"),
+    } else .{
+        b.pathFromRoot("test/pngsuite"),
+        b.pathFromRoot("test/corpus"),
+    };
     const opts_src = opts.add("build_options.zig", b.fmt(
         \\pub const pngsuite_root: []const u8 = "{s}";
         \\pub const realworld_root: []const u8 = "{s}";
         \\
-    , .{ b.pathFromRoot("test/pngsuite"), b.pathFromRoot("test/corpus") }));
+    , roots));
     const opts_mod = b.createModule(.{ .root_source_file = opts_src });
 
     const tests = b.addTest(.{
