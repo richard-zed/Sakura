@@ -296,6 +296,15 @@ test "every real-world corpus file decodes to its ImageMagick-verified hash" {
         std.debug.print("\nrealworld: expected.txt lists no reference rows\n", .{});
         return error.NoReferenceRows;
     }
+    // These binaries are gitignored (licensing + size) and fetched by
+    // tools/fetch_corpus.sh, so a fresh clone legitimately has none of them.
+    // Nothing fetched at all means "not downloaded", not "regressed": skip.
+    // PARTIAL presence is the dangerous case -- a corpus that is half there
+    // must not pass, so only the all-absent case is allowed through.
+    if (checked == 0 and absent > 0) {
+        std.debug.print("\nrealworld: no files fetched ({d} absent), run tools/fetch_corpus.sh\n", .{absent});
+        return;
+    }
     // big-4k.png is listed but not downloadable, so it is legitimately absent.
     const expected_present = reference_lines - 1;
     if (checked != expected_present) {

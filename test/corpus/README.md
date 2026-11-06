@@ -1,7 +1,10 @@
 # Real-file PNG corpus
 
 Seven real-world PNGs, all verified byte-exact against ImageMagick.
-Not committed as binaries (licensing + size); fetch with `tools/fetch_corpus.sh`.
+Committed as binaries: they are the only oracle in the tree this decoder did not
+produce, and CI must grade them rather than skip. `tools/fetch_corpus.sh`
+re-downloads them if they are ever lost; the expected hashes are the authority,
+not the download.
 
 Expected RGBA8 output hashes are in `expected.txt`.
 

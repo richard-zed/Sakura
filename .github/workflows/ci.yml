@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the version in build.zig.zon (.minimum_zig_version = 0.16.0).
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Debug only. ReleaseFast is for profiling, not a correctness gate.
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Format
+        run: zig fmt --check src build.zig

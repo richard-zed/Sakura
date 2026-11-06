@@ -1,6 +1,5 @@
 zig-out/
 .zig-cache/
-test/corpus/*.png
 test/corpus/*.raw
 *.sakura.raw
 ref_*.raw
